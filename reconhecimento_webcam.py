@@ -1,162 +1,160 @@
 import cv2
 import numpy as np
 import tensorflow as tf
-import time
 import psutil
-import multiprocessing
+import time
+import threading
 import tkinter as tk
-from tkinter import Label
-from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates
-from threading import Thread
+import multiprocessing
+import GPUtil
 
-# 📌 Inicializar NVML para monitoramento da GPU
-try:
-    nvmlInit()
-    gpu_handle = nvmlDeviceGetHandleByIndex(0)
-    gpu_available = True
-except:
-    gpu_available = False
+# Carregar o modelo salvo
+modelo = tf.keras.models.load_model("modelo_emocoes.h5")
 
-# 📌 Função para monitoramento em uma Thread (evita problemas com Multiprocessing no Windows)
-def monitoramento(fps):
-    def atualizar_monitor():
+# Lista de emoções
+emocoes = ["Raiva", "Nojo", "Medo", "Feliz", "Neutro", "Triste", "Surpreso"]
+
+# Configuração global para modo CPU/GPU
+modo_uso = multiprocessing.Value("i", 0)  # 0 = CPU, 1 = GPU
+
+def escolher_modo():
+    """Janela para selecionar CPU ou GPU antes de iniciar a câmera."""
+    def selecionar_cpu():
+        modo_uso.value = 0
+        root.destroy()
+
+    def selecionar_gpu():
+        modo_uso.value = 1
+        root.destroy()
+
+    root = tk.Tk()
+    root.title("Escolha o Modo de Execução")
+
+    label = tk.Label(root, text="Escolha como deseja rodar o reconhecimento facial:")
+    label.pack(pady=10)
+
+    btn_cpu = tk.Button(root, text="Usar CPU", command=selecionar_cpu)
+    btn_cpu.pack(pady=5)
+
+    btn_gpu = tk.Button(root, text="Usar GPU", command=selecionar_gpu)
+    btn_gpu.pack(pady=5)
+
+    root.mainloop()
+
+def obter_info_gpu():
+    """Verifica se há GPUs disponíveis, incluindo integradas."""
+    gpus = GPUtil.getGPUs()
+    if gpus:
+        return gpus[0].name  # Retorna o nome da primeira GPU dedicada encontrada
+    
+    # Verifica via TensorFlow
+    gpus_tf = tf.config.experimental.list_physical_devices('GPU')
+    if gpus_tf:
+        return gpus_tf[0].name
+    
+    # Caso não encontre GPUs, verifica gráficos integrados via psutil
+    for proc in psutil.process_iter(['pid', 'name']):
+        if 'intel' in proc.info['name'].lower() or 'amd' in proc.info['name'].lower():
+            return proc.info['name']
+    
+    return None
+
+def monitorar_desempenho():
+    """Mostra o uso da CPU e GPU geral do sistema em uma janela separada."""
+    root = tk.Tk()
+    root.title("Desempenho do Programa")
+
+    label_cpu_total = tk.Label(root, text="CPU Geral: 0%")
+    label_cpu_total.pack(pady=5)
+
+    label_gpu_total = tk.Label(root, text="GPU Geral: 0%")
+    label_gpu_total.pack(pady=5)
+
+    def atualizar():
+        """Atualiza os valores de uso da CPU e GPU dinamicamente."""
         while True:
-            uso_cpu_programa = psutil.Process().cpu_percent()
-            label_cpu_programa.config(text=f"CPU (Programa): {uso_cpu_programa:.1f}%")
-
-            uso_cpu_total = psutil.cpu_percent()
-            label_cpu_total.config(text=f"CPU (Total): {uso_cpu_total:.1f}%")
-
-            if gpu_available:
-                uso_gpu = nvmlDeviceGetUtilizationRates(gpu_handle)
-                label_gpu_programa.config(text=f"GPU (Programa): {uso_gpu.gpu:.1f}%")
-                label_gpu_total.config(text=f"GPU (Total): {uso_gpu.gpu:.1f}%")
+            cpu_total = psutil.cpu_percent(interval=1)  # Atualiza a cada 1s
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu_total = sum(gpu.load * 100 for gpu in gpus) / len(gpus)
             else:
-                label_gpu_programa.config(text="GPU (Programa): N/A")
-                label_gpu_total.config(text="GPU (Total): N/A")
-
-            label_fps.config(text=f"FPS: {int(fps.value)}")
-            monitor.update_idletasks()
+                gpu_total = 0
+            
+            label_cpu_total.config(text=f"CPU Geral: {cpu_total:.1f}%")
+            label_gpu_total.config(text=f"GPU Geral: {gpu_total:.1f}%")
+            
             time.sleep(1)
 
-    # Criar janela Tkinter
-    monitor = tk.Tk()
-    monitor.title("Monitoramento de Desempenho")
-    monitor.geometry("300x200")
+    threading.Thread(target=atualizar, daemon=True).start()
+    root.mainloop()
 
-    # Criar Labels
-    label_cpu_programa = Label(monitor, text="CPU (Programa): --%", font=("Arial", 12))
-    label_cpu_programa.pack()
+def iniciar_reconhecimento():
+    """Inicia o reconhecimento facial com a webcam e faz previsões de emoções."""
+    cap = cv2.VideoCapture(0)
 
-    label_cpu_total = Label(monitor, text="CPU (Total): --%", font=("Arial", 12))
-    label_cpu_total.pack()
-
-    label_gpu_programa = Label(monitor, text="GPU (Programa): --%", font=("Arial", 12))
-    label_gpu_programa.pack()
-
-    label_gpu_total = Label(monitor, text="GPU (Total): --%", font=("Arial", 12))
-    label_gpu_total.pack()
-
-    label_fps = Label(monitor, text="FPS: --", font=("Arial", 12))
-    label_fps.pack()
-
-    # Rodar a atualização em uma Thread separada
-    thread_atualizacao = Thread(target=atualizar_monitor, daemon=True)
-    thread_atualizacao.start()
-
-    monitor.mainloop()
-
-# 📌 Função para iniciar a webcam
-def iniciar_webcam(usar_gpu, fps):
-    if usar_gpu:
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print("🚀 Usando GPU!")
-        else:
-            print("⚠️ Nenhuma GPU encontrada! Rodando na CPU...")
-    else:
-        tf.config.set_visible_devices([], 'GPU')
-        print("💻 Usando apenas CPU.")
-
-    modelo = tf.keras.models.load_model("modelo_emocoes.h5")
-    emocoes = ["Raiva", "Nojo", "Medo", "Feliz", "Neutro", "Triste", "Surpreso"]
-
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-
-    ultimo_tempo = time.time()
+    # Verifique se a webcam foi aberta corretamente
+    if not cap.isOpened():
+        print("Erro ao acessar a webcam.")
+        return
 
     while True:
         ret, frame = cap.read()
         if not ret:
+            print("Falha ao capturar imagem.")
             break
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small_gray = cv2.resize(gray, (frame.shape[1] // 2, frame.shape[0] // 2))
-        faces = face_cascade.detectMultiScale(small_gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+        # Pre-processamento da imagem para o modelo
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # Converte para escala de cinza
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
         for (x, y, w, h) in faces:
-            x, y, w, h = x * 2, y * 2, w * 2, h * 2
+            face_region = frame[y:y+h, x:x+w]
+            face_region = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)  # Convertendo a face para escala de cinza
+            face_region = cv2.resize(face_region, (48, 48))  # Redimensiona para 48x48
+            face_region = np.expand_dims(face_region, axis=-1)  # Adiciona o canal único (1)
+            face_region = np.expand_dims(face_region, axis=0)  # Adiciona a dimensão do batch (1, 48, 48, 1)
+            face_region = face_region / 255.0  # Normaliza a imagem
 
-            face_roi = gray[y:y+h, x:x+w]
-            face_roi = cv2.resize(face_roi, (48, 48)) / 255.0
-            face_roi = np.expand_dims(face_roi, axis=0).reshape(-1, 48, 48, 1)
+            # Fazer a previsão
+            predicao = modelo.predict(face_region)
+            emocao = emocoes[np.argmax(predicao)]
 
-            previsao = modelo.predict(face_roi, verbose=0)
-            emocao_detectada = emocoes[np.argmax(previsao)]
+            # Desenhar a caixa ao redor do rosto e a emoção prevista
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+            cv2.putText(frame, emocao, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
 
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(frame, emocao_detectada, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        cv2.imshow('Reconhecimento Facial', frame)
 
-        tempo_atual = time.time()
-        fps.value = 1 / (tempo_atual - ultimo_tempo)
-        ultimo_tempo = tempo_atual
-
-        cv2.imshow("Reconhecimento de Emoções", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        # Pressione 'q' para sair
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
 
-# 📌 Função para escolher o modo (CPU/GPU)
-def escolher_modo():
-    root = tk.Tk()
-    root.title("Escolha o Modo de Execução")
-    root.geometry("300x150")
-
-    def definir_modo(modo):
-        global usar_gpu
-        usar_gpu = (modo == "gpu")
-        root.destroy()  # Fecha a janela de escolha
-
-    label = tk.Label(root, text="Escolha o modo de processamento:", font=("Arial", 12))
-    label.pack(pady=10)
-
-    btn_cpu = tk.Button(root, text="CPU Mode", font=("Arial", 10), command=lambda: definir_modo("cpu"), width=15)
-    btn_cpu.pack(pady=5)
-
-    btn_gpu = tk.Button(root, text="GPU Mode", font=("Arial", 10), command=lambda: definir_modo("gpu"), width=15)
-    btn_gpu.pack(pady=5)
-
-    root.mainloop()
-
-# 📌 Função para iniciar os processos
-def iniciar_processos():
-    with multiprocessing.Manager() as manager:
-        fps = manager.Value("d", 0.0)
-
-        processo_webcam = multiprocessing.Process(target=iniciar_webcam, args=(usar_gpu, fps))
-        thread_monitoramento = Thread(target=monitoramento, args=(fps,), daemon=True)
-
-        processo_webcam.start()
-        thread_monitoramento.start()
-
-        processo_webcam.join()
-
-# 📌 Executar apenas no processo principal
 if __name__ == "__main__":
-    escolher_modo()  # Pergunta ao usuário se quer CPU ou GPU
-    iniciar_processos()  # Inicia os processos depois da escolha
+    # Escolher CPU ou GPU antes de iniciar
+    escolher_modo()
+
+    # Verificar se há GPU disponível e configurar TensorFlow
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        gpu_nome = gpus[0].name
+        print(f"GPU detectada: {gpu_nome}")
+        if modo_uso.value == 1:
+            tf.config.experimental.set_memory_growth(gpus[0], True)
+    else:
+        print("Nenhuma GPU detectada. Usando CPU.")
+    
+    # Iniciar monitoramento de desempenho em um processo separado
+    thread_desempenho = multiprocessing.Process(target=monitorar_desempenho)
+    thread_desempenho.start()
+
+    # Iniciar o reconhecimento facial em um processo separado
+    thread_reconhecimento = multiprocessing.Process(target=iniciar_reconhecimento)
+    thread_reconhecimento.start()
+
+    # Esperar os processos terminarem
+    thread_reconhecimento.join()
+    thread_desempenho.terminate()
